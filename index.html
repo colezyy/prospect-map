@@ -1,0 +1,124 @@
+<!doctype html><html lang="en-GB"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<link rel="manifest" href="manifest.json"><meta name="apple-mobile-web-app-capable" content="yes"><title>Prospect Map</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.markercluster/1.5.3/MarkerCluster.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.markercluster/1.5.3/MarkerCluster.Default.css">
+<style>
+*{box-sizing:border-box}html,body{margin:0;height:100%;font:15px system-ui,sans-serif}
+#top{position:absolute;z-index:1000;top:env(safe-area-inset-top,0);left:0;right:0;background:#fff;padding:8px;box-shadow:0 1px 6px #0003}
+#top input,#top select,#top button{font:inherit;padding:8px;margin:2px 0;border:1px solid #bbb;border-radius:8px;background:#fff}
+#row{display:flex;gap:6px}#row input{flex:1;min-width:0}#filters{display:none}#filters.open{display:block}
+#filters select{width:100%}#stats{font-size:13px;color:#333;margin-top:4px}
+#map{position:absolute;inset:0}#list{display:none;position:absolute;inset:0;padding-top:150px;overflow:auto;background:#fff;z-index:900}
+#list div{padding:10px;border-bottom:1px solid #eee}
+#sheet{position:absolute;z-index:1100;left:0;right:0;bottom:0;background:#fff;border-radius:14px 14px 0 0;padding:12px 12px calc(12px + env(safe-area-inset-bottom,0));box-shadow:0 -2px 10px #0004;max-height:70%;overflow:auto;display:none}
+#sheet button,#sheet select,#sheet input,#sheet textarea{font:inherit;padding:10px;margin:3px 0;border:1px solid #bbb;border-radius:8px;background:#fff}
+#sheet textarea{width:100%}.st button{margin:2px}.pin{width:26px;height:26px;border-radius:50%;border:2px solid #fff;color:#fff;font:700 12px/22px system-ui;text-align:center;box-shadow:0 0 3px #000a}
+#msg{position:absolute;z-index:1050;top:150px;left:50%;transform:translateX(-50%);background:#111d;color:#fff;padding:6px 12px;border-radius:16px;font-size:13px;display:none}
+#login{position:absolute;z-index:3000;inset:0;background:#fff;padding:24px;display:none}
+</style></head><body>
+<div id="login"><h2>Prospect Map</h2><p>Sign in with your email (magic link).</p>
+<input id="em" type="email" placeholder="you@example.com"> <button id="go">Send link</button><p id="lm"></p></div>
+<div id="top"><div id="row"><input id="q" placeholder="Town, postcode or business name"><button id="fbtn" aria-label="Filters">☰</button></div>
+<div id="filters"><select id="cat"></select><select id="stf"><option value="">All statuses</option></select>
+<label><input type="checkbox" id="nochain"> Hide national chains/franchises</label>
+<div><button id="searchArea">Find businesses in this area</button> <button id="loc">📍 Near me</button> <button id="tog">List</button> <button id="exp">Export CSV</button></div></div>
+<div id="stats"></div></div>
+<div id="map"></div><div id="list"></div><div id="msg"></div><div id="sheet"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.markercluster/1.5.3/leaflet.markercluster.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
+<script src="config.js"></script>
+<script>
+const $=id=>document.getElementById(id);
+const sb=supabase.createClient(CFG.SUPABASE_URL,CFG.SUPABASE_ANON_KEY);
+// Default statuses: [label, colour, letter] — letter keeps status readable without colour
+const ST={not_visited:["Not visited","#2563eb","N"],approached:["Approached","#f59e0b","A"],follow_up:["Follow-up required","#7c3aed","F"],sold:["Sold","#6b7280","S"],not_interested:["Not interested","#6b7280","X"],not_suitable:["Not suitable","#6b7280","U"],closed:["Closed / unverified","#cbd5e1","C"]};
+const map=L.map("map",{zoomControl:false}).setView([54.5,-3],6);
+L.control.zoom({position:"bottomright"}).addTo(map);
+L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",{maxZoom:19,attribution:"© OpenStreetMap contributors"}).addTo(map);
+const cluster=L.markerClusterGroup({chunkedLoading:true}).addTo(map), areas=L.layerGroup().addTo(map);
+let rows=[],cur=null,CATS={};
+function msg(t,ms=3000){const m=$("msg");m.textContent=t;m.style.display="block";clearTimeout(msg.t);if(ms)msg.t=setTimeout(()=>m.style.display="none",ms)}
+for(const[k,v]of Object.entries(ST))$("stf").add(new Option(v[0],k));
+async function init(){
+  const{data:{session}}=await sb.auth.getSession();
+  if(!session){$("login").style.display="block";return}
+  $("login").style.display="none";
+  const{data:cats}=await sb.from("categories").select("key,label,grp,osm").order("grp").order("label");
+  CATS=Object.fromEntries((cats||[]).map(c=>[c.key,c]));$("cat").add(new Option("All categories",""));(cats||[]).forEach(c=>$("cat").add(new Option(`${c.grp}: ${c.label}`,c.key)));
+  load();stats();
+}
+$("go").onclick=async()=>{const{error}=await sb.auth.signInWithOtp({email:$("em").value,options:{emailRedirectTo:location.href}});$("lm").textContent=error?error.message:"Check your email."};
+sb.auth.onAuthStateChange((e)=>{if(e==="SIGNED_IN")init()});
+$("fbtn").onclick=()=>$("filters").classList.toggle("open");
+async function load(){
+  if(map.getZoom()<10){cluster.clearLayers();rows=[];renderList();msg("Zoom in to load businesses (town level)");return}
+  const b=map.getBounds(),st=$("stf").value,cat=$("cat").value;
+  const{data,error}=await sb.rpc("businesses_in_view",{w:b.getWest(),s:b.getSouth(),e:b.getEast(),n:b.getNorth(),
+    cats:cat?[cat]:null,statuses:st?[st]:null,hide_chains:$("nochain").checked,lim:1000});
+  if(error)return msg("Load failed: "+error.message,0);
+  rows=data;draw();
+  if(!rows.length)msg("No saved listings here yet. Tap “Find businesses in this area”. This doesn't mean none exist.",5000);
+  const{data:a}=await sb.from("searched_areas").select("bbox,category,created_at").limit(200);areas.clearLayers();
+}
+function icon(s){const[,c,l]=ST[s]||ST.not_visited;return L.divIcon({className:"",html:`<div class="pin" style="background:${c}">${l}</div>`,iconSize:[26,26]})}
+function draw(){cluster.clearLayers();rows.forEach(r=>{r.m=L.marker([r.lat,r.lng],{icon:icon(r.status),title:`${r.name} — ${ST[r.status]?.[0]}`}).on("click",()=>open(r));cluster.addLayer(r.m)});renderList()}
+function renderList(){$("list").innerHTML=rows.map((r,i)=>`<div data-i="${i}"><b>${esc(r.name)}</b><br>${esc(r.address||"")} ${esc(r.postcode||"")}<br>${ST[r.status]?.[0]}</div>`).join("")||"<div>Nothing loaded.</div>";
+  $("list").querySelectorAll("[data-i]").forEach(d=>d.onclick=()=>{$("list").style.display="none";$("tog").textContent="List";open(rows[d.dataset.i]);map.setView([rows[d.dataset.i].lat,rows[d.dataset.i].lng],17)})}
+const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+function open(r){cur=r;const sh=$("sheet");sh.style.display="block";
+  const dir=`https://maps.apple.com/?daddr=${r.lat},${r.lng}`;
+  sh.innerHTML=`<b style="font-size:17px">${esc(r.name)}</b> <button onclick="$('sheet').style.display='none'" style="float:right">✕</button>
+  <div>${esc(r.categories.join(", "))} · ${esc(r.address||"")} ${esc(r.postcode||"")} ${esc(r.town||"")}</div>
+  <div style="font-size:12px;color:#555">${r.lat.toFixed(5)}, ${r.lng.toFixed(5)} · Source: ${esc(r.source)} · Checked ${r.last_checked?.slice(0,10)} · Ownership: ${esc(r.ownership)}</div>
+  <p><a href="${dir}">Directions</a> ${r.phone?` · <a href="tel:${esc(r.phone)}">${esc(r.phone)}</a>`:""} ${r.website?` · <a href="${esc(r.website)}" target="_blank" rel="noopener">Website</a>`:""}</p>
+  <div class="st">${Object.entries(ST).map(([k,v])=>`<button data-s="${k}" style="${k===r.status?`background:${v[1]};color:#fff`:""}">${v[0]}</button>`).join("")}</div>
+  <textarea id="nt" rows="3" placeholder="Notes">${esc(r.notes||"")}</textarea>
+  <div>Follow-up: <input type="date" id="fu" value="${r.follow_up||""}"></div>
+  <div>Sale: <input id="nc" type="number" min="1" value="1" style="width:70px"> cards at £<input id="pr" type="number" step="0.01" style="width:90px"> <button id="sell">Record sale</button></div>
+  <div>Flag: <button data-f="review">Review</button><button data-f="duplicate">Duplicate</button><button data-f="closed">Closed</button></div><div id="sv"></div>`;
+  sh.querySelectorAll("[data-s]").forEach(b=>b.onclick=()=>save({status:b.dataset.s,last_visit:new Date().toISOString().slice(0,10)}));
+  sh.querySelectorAll("[data-f]").forEach(b=>b.onclick=()=>save({flag:b.dataset.f}));
+  $("nt").onblur=()=>$("nt").value!==(r.notes||"")&&save({notes:$("nt").value});
+  $("fu").onchange=()=>save({follow_up:$("fu").value||null});
+  $("sell").onclick=async()=>{const{error}=await sb.from("sales").insert({business_id:r.id,cards:+$("nc").value,price:+$("pr").value||0});
+    if(error)return msg("Sale NOT saved: "+error.message,0);save({status:"sold"});stats()};
+}
+async function save(patch){const r=cur,sv=$("sv");sv.textContent="Saving…";
+  const{error}=await sb.from("businesses").update({...patch,updated_at:new Date().toISOString()}).eq("id",r.id);
+  if(error){sv.innerHTML=`⚠ Save failed (${esc(error.message)}) <button id="rt">Retry</button>`;$("rt").onclick=()=>save(patch);return}
+  Object.assign(r,patch);r.m.setIcon(icon(r.status));sv.textContent="✓ Saved";open(r);$("sv").textContent="✓ Saved";stats()}
+async function stats(){const c=async s=>(await sb.from("businesses").select("*",{count:"exact",head:true}).match(s?{status:s}:{})).count??0;
+  const[t,u,a,so]=await Promise.all([c(),c("not_visited"),c("approached"),c("sold")]);
+  const{data:sl}=await sb.from("sales").select("cards,price");
+  const cards=(sl||[]).reduce((x,y)=>x+y.cards,0),rev=(sl||[]).reduce((x,y)=>x+ +y.price,0);
+  $("stats").textContent=`${t} saved · ${u} unvisited · ${a} approached · ${so} sold · ${cards} cards · £${rev.toFixed(2)} recorded`}
+$("searchArea").onclick=async()=>{const cat=$("cat").value;if(!cat)return msg("Pick one category first");
+  if(map.getZoom()<12)return msg("Zoom in to town level first");
+  const b=map.getBounds(),w=b.getWest(),s=b.getSouth(),e=b.getEast(),n=b.getNorth();
+  msg("Searching OpenStreetMap…",0);
+  const q=`[out:json][timeout:25];(${CATS[cat].osm.map(f=>`nwr${f}(${s},${w},${n},${e});`).join("")});out center tags;`;
+  const MIR=["https://overpass-api.de/api/interpreter","https://overpass.kumi.systems/api/interpreter"];let data=null,err="";
+  for(const u of MIR){for(let i=0;i<2&&!data;i++){try{const r=await fetch(u,{method:"POST",body:"data="+encodeURIComponent(q)});
+    if(r.ok)data=await r.json();else{err=r.status;await new Promise(x=>setTimeout(x,1500))}}catch(x){err=x.message}}if(data)break}
+  if(!data)return msg("Data provider unavailable ("+err+"). Try again shortly.",0);
+  const out=data.elements.map(el=>{const t=el.tags||{},lat=el.lat??el.center?.lat,lng=el.lon??el.center?.lon;if(!t.name||lat==null)return null;
+    return{name:t.name.trim(),category:cat,address:[t["addr:housenumber"],t["addr:street"]].filter(Boolean).join(" ")||null,postcode:t["addr:postcode"]?.toUpperCase()||null,
+    town:t["addr:city"]||null,lat,lng,phone:t.phone||t["contact:phone"]||null,website:t.website||t["contact:website"]||null,
+    source:"osm",source_id:el.type+"/"+el.id,ownership:t["brand:wikidata"]?"national_chain":"unknown"}}).filter(Boolean);
+  if(out.length){const{error}=await sb.rpc("import_businesses",{rows:out});if(error)return msg("Save failed: "+error.message,0)}
+  msg(`Found ${out.length} listings in OpenStreetMap for this area (not necessarily every business).`,5000);load();stats()};
+$("q").onkeydown=async e=>{if(e.key!=="Enter")return;
+  const r=await fetch("https://nominatim.openstreetmap.org/search?format=json&limit=1&countrycodes=gb&q="+encodeURIComponent($("q").value));
+  const j=await r.json();if(!j[0])return msg("Place not found");const b=j[0].boundingbox;map.fitBounds([[b[0],b[2]],[b[1],b[3]]])};
+$("loc").onclick=()=>navigator.geolocation.getCurrentPosition(p=>map.setView([p.coords.latitude,p.coords.longitude],15),()=>msg("Location permission denied"));
+$("tog").onclick=()=>{const on=$("list").style.display!=="block";$("list").style.display=on?"block":"none";$("tog").textContent=on?"Map":"List"};
+["cat","stf","nochain"].forEach(i=>$(i).onchange=load);map.on("moveend",load);
+$("exp").onclick=async()=>{let all=[],f=0,d;do{({data:d}=await sb.from("businesses").select("name,categories,address,postcode,town,phone,website,source,source_id,ownership,status,notes,last_visit,follow_up").range(f,f+999));all=all.concat(d||[]);f+=1000}while(d?.length===1000);
+  if(!all.length)return msg("Nothing to export");const k=Object.keys(all[0]);
+  const csv=[k.join(","),...all.map(r=>k.map(x=>`"${String(Array.isArray(r[x])?r[x].join(";"):r[x]??"").replace(/"/g,'""')}"`).join(","))].join("\n");
+  const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([csv],{type:"text/csv"}));a.download="prospects.csv";a.click()};
+init();
+</script></body></html>
